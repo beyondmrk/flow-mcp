@@ -1,0 +1,14 @@
+# Copy to config.toml (gitignored). work_root is the only key you must set.
+
+# The path fence. Every project_dir, reference image and download must sit under work_root.
+# Unset = every path is refused (PATH_REFUSED).
+work_root = "C:\\flow-projects"
+# Refused even when under work_root (a network mount, a synced folder).
+denied_roots = []
+
+edge_exe = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+cdp_port = 9333
+# The dedicated Edge profile. Default: .edge-profile inside this checkout.
+# profile_dir = "C:\\path\\to\\flow-mcp\\.edge-profile"
+flow_url = "https://flow.google.com/"
+commit_timeout_s = 90

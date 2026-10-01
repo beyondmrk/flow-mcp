@@ -1,0 +1,24 @@
+[project]
+name = "flow-mcp"
+version = "0.1.0"
+description = "Local MCP bridge to Google Flow via a dedicated Edge over CDP"
+requires-python = ">=3.12"
+dependencies = ["mcp>=1.10,<2", "playwright>=1.47", "pillow>=10"]
+
+[project.scripts]
+flow-mcp = "flow_mcp.server:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flow_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["browser: needs local Edge (msedge channel)", "live: needs signed-in dedicated Edge"]
+addopts = ["-m", "not live"]
