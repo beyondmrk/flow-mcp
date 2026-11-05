@@ -1,11 +1,14 @@
 """One dedicated Edge, own profile, background throttling off. We attach over CDP and never
 kill it: it outlives the MCP process so the Google sign-in and open project persist.
 
-Tab model (LIVE 2026-09-30, Task 4): attach-only, one SHARED Flow tab. In this Edge a tab created
-after a Playwright attach (Target.createTarget / context.new_page) hangs its renderer on its first
-navigation, and a hung tab then blocks every connect_over_cdp. So a bridge never creates a tab
-unless THIS process just launched Edge (the launch URL opens it). The MCP server and flow_fire.py
-are peers on the same tab, serialised by the browser-wide TabLock (runlock.TabLock)."""
+Tab model (LIVE 2026-11-04, multi-tab): attach-only, ONE TAB PER FLOW PROJECT. In this Edge a tab
+created over CDP after a Playwright attach (Target.createTarget / context.new_page) hangs its renderer
+on its first navigation, and a hung tab then blocks every connect_over_cdp. So a bridge never creates a
+tab over CDP: a new tab is opened by asking EDGE ITSELF (`msedge.exe --new-window <url>` into the running
+profile - verified 2026-11-04: attaches and navigates normally). A project's tab is found by URL
+(/project/<id>), so nothing has to be remembered across an Edge or MCP restart. Several MCP servers
+(one per Claude session) and flow_fire.py are peers; each project's tab is serialised by its own
+TabLock (runlock.TabLock(key=project id)), so two projects drive two tabs at the same time."""
 import base64
 import json
 import os
@@ -27,13 +30,32 @@ PING_TIMEOUT_S = 5.0
 CONNECT_TIMEOUT_MS = 30000
 CONNECT_TRIES = 2
 LAUNCH_TAB_WAIT_S = 20.0
+HUNG_TRIES = 3  # a page is "hung" only when it misses this many pings in a row
+HUNG_RETRY_S = 5.0
 
 
-def edge_args(cfg: Config) -> list[str]:
-    return [str(cfg.edge_exe), f"--remote-debugging-port={cfg.cdp_port}",
+def edge_args(cfg: Config, url: str | None = None, new_window: bool = False) -> list[str]:
+    """The Edge command line. url defaults to the Flow home; new_window asks a RUNNING Edge (same
+    profile dir) to open the url in a new window instead of a tab of the current one."""
+    args = [str(cfg.edge_exe), f"--remote-debugging-port={cfg.cdp_port}",
             f"--user-data-dir={cfg.profile_dir}", "--no-first-run", "--no-default-browser-check",
             "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
-            "--disable-backgrounding-occluded-windows", cfg.flow_url]
+            "--disable-backgrounding-occluded-windows"]
+    if new_window:
+        args.append("--new-window")
+    return args + [url or cfg.flow_url]
+
+
+def flow_base(cfg: Config) -> str:
+    return cfg.flow_url.split("/project/")[0].rstrip("/")
+
+
+def project_url(cfg: Config, project_id: str) -> str:
+    return f"{flow_base(cfg)}/project/{project_id}"
+
+
+def project_pages(targets: list[dict], project_id: str) -> list[dict]:
+    return [t for t in flow_pages(targets) if f"/project/{project_id}" in str(t.get("url", ""))]
 
 
 def _listening(port: int) -> bool:
@@ -103,25 +125,76 @@ def cdp_ping(url: str, timeout: float = PING_TIMEOUT_S) -> bool:
 
 
 class Browser:
-    """Attach-only, one shared Flow tab chosen from /json/list (a Flow-hostname page). A tab is
-    created only by launching Edge with the Flow URL; nothing is ever closed."""
+    """Attach-only. page() hands out the tab of the project selected with use(project_id): the Flow
+    page whose URL is /project/<id>, opened as a new Edge window when there is none. With no project
+    selected (use(None)) it is the remembered tab, else the first Flow tab. Tabs are created only by
+    Edge itself (launch URL / --new-window), never over CDP; nothing is ever closed."""
 
     def __init__(self, cfg: Config):
         self.cfg, self._pw, self._b, self._page, self._cbs = cfg, None, None, None, []
-        self._launched, self._target_id = False, None
+        self._launched, self._target_id, self._project_id, self._wired = False, None, None, set()
 
-    def _launch_if_needed(self) -> None:
+    def _spawn(self, url: str | None, new_window: bool) -> None:
+        subprocess.Popen(edge_args(self.cfg, url, new_window), creationflags=subprocess.DETACHED_PROCESS,
+                         close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+
+    def _launch_if_needed(self, url: str | None = None) -> None:
         if _listening(self.cfg.cdp_port):
             return
         self._launched = True
-        subprocess.Popen(edge_args(self.cfg), creationflags=subprocess.DETACHED_PROCESS,
-                         close_fds=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
+        self._spawn(url, False)
         for _ in range(40):
             if _listening(self.cfg.cdp_port):
                 return
             time.sleep(0.25)
         raise FlowError("BROWSER_DOWN", f"Edge did not open port {self.cfg.cdp_port}")
+
+    def use(self, project_id: str | None) -> None:
+        """Select the tab every later page() call returns: the tab on /project/<project_id>, or with
+        None the remembered / first Flow tab. Cheap when unchanged."""
+        if project_id != self._project_id:
+            self._project_id, self._page = project_id, None
+
+    def _open_window(self, url: str) -> None:
+        """Ask the running Edge for a new window at url (never Target.createTarget - see module doc)."""
+        self._spawn(url, True)
+
+    def new_home_tab(self) -> None:
+        """A fresh tab on the Flow home, for flow_open_project: it becomes the project's tab once the
+        project page has loaded. Selected as the remembered tab (use(None))."""
+        self._launch_if_needed()
+        before = {t.get("id") for t in flow_pages(list_targets(self.cfg.cdp_port))}
+        self._open_window(self.cfg.flow_url)
+        end = time.time() + LAUNCH_TAB_WAIT_S
+        while True:
+            fresh = [t for t in flow_pages(list_targets(self.cfg.cdp_port)) if t.get("id") not in before]
+            if fresh:
+                self._project_id, self._target_id, self._page = None, fresh[0].get("id"), None
+                return
+            if time.time() >= end:
+                raise FlowError("BROWSER_DOWN", f"Edge opened no new Flow tab within {LAUNCH_TAB_WAIT_S:.0f}s")
+            time.sleep(0.5)
+
+    def _choose_project(self, project_id: str) -> dict:
+        """The tab on /project/<project_id>; opened as a new window when missing. Two such tabs is a
+        refusal (the user closes one): the bridge never guesses which one a peer is driving."""
+        opened = False
+        end = time.time() + LAUNCH_TAB_WAIT_S
+        while True:
+            mine = project_pages(list_targets(self.cfg.cdp_port), project_id)
+            if len(mine) > 1:
+                raise FlowError("BROWSER_DOWN", f"{len(mine)} Flow tabs on project {project_id} - "
+                                "close all but one in the dedicated Edge")
+            if mine:
+                return mine[0]
+            if not opened:
+                self._open_window(project_url(self.cfg, project_id))
+                opened = True
+            elif time.time() >= end:
+                raise FlowError("BROWSER_DOWN", f"Edge opened no tab on project {project_id} within "
+                                f"{LAUNCH_TAB_WAIT_S:.0f}s")
+            time.sleep(0.5)
 
     def _choose(self) -> dict:
         """The shared Flow tab: the remembered target if still there, else the first Flow page.
@@ -138,9 +211,19 @@ class Browser:
             time.sleep(0.5)
 
     def _hung_targets(self) -> list[str]:
-        """Page targets (Flow or not) whose renderer does not answer a raw CDP ping, as "id url"."""
-        return [f"{t.get('id')} {t.get('url')}" for t in list_targets(self.cfg.cdp_port)
-                if t.get("type") == "page" and not cdp_ping(ws_url(t, self.cfg.cdp_port))]
+        """Page targets (Flow or not) whose renderer does not answer a raw CDP ping, as "id url".
+        A page is called hung only after HUNG_TRIES pings: a browser busy loading another project's
+        window (live 2026-11-04: two windows opened at once) misses one 5 s ping and answers the next."""
+        hung = {}
+        for i in range(HUNG_TRIES):
+            hung = {t.get("id"): f"{t.get('id')} {t.get('url')}" for t in list_targets(self.cfg.cdp_port)
+                    if t.get("type") == "page" and (hung is None or i == 0 or t.get("id") in hung)
+                    and not cdp_ping(ws_url(t, self.cfg.cdp_port))}
+            if not hung:
+                return []
+            if i < HUNG_TRIES - 1:
+                time.sleep(HUNG_RETRY_S)
+        return list(hung.values())
 
     def _connect(self) -> None:
         """connect_over_cdp attaches to EVERY target of the browser; Playwright has no option to skip
@@ -172,8 +255,8 @@ class Browser:
                 and self._b is not None and self._b.is_connected()):
             return self._page
         self._page = None
-        self._launch_if_needed()
-        t = self._choose()
+        self._launch_if_needed(project_url(self.cfg, self._project_id) if self._project_id else None)
+        t = self._choose_project(self._project_id) if self._project_id else self._choose()
         if not cdp_ping(ws_url(t, self.cfg.cdp_port)):
             raise FlowError("BROWSER_DOWN", f"Flow tab {t.get('id')} ({t.get('url')}) does not answer CDP "
                             f"within {PING_TIMEOUT_S:.0f}s - its renderer is hung; close that tab by hand")
@@ -183,7 +266,9 @@ class Browser:
             raise FlowError("BROWSER_DOWN", f"{len(pages)} Playwright pages at {t.get('url')} for target "
                             f"{t.get('id')} - leave exactly one Flow tab on that URL")
         self._target_id, self._page = t.get("id"), pages[0]
-        self._page.on("response", self._dispatch)
+        if id(self._page) not in self._wired:  # one response hook per Playwright page, ever
+            self._page.on("response", self._dispatch)
+            self._wired.add(id(self._page))
         return self._page
 
     def _dispatch(self, resp) -> None:

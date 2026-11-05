@@ -18,8 +18,10 @@ bridge is a set of refusals around that:
 - **A paid clip needs a lint stamp.** `flow_fire_clip` refuses `LINT_REQUIRED` unless the manifest
   was linted and the prompt it is about to send is the prompt that was linted.
 - **A committed line is not fired again.** `ALREADY_COMMITTED`, unless `reroll=True`.
-- **One run per project, one job on the tab.** `RUN_LOCKED` and a browser-wide tab lock keep two
-  processes from steering the same window.
+- **One run per project, one driver per project window.** Each Flow project gets its own Edge
+  window (opened by Edge itself, never over CDP), found by its `/project/<id>` URL. `RUN_LOCKED` and
+  a per-project tab lock (`_tab.<id>.lock`) keep two processes from steering the same window, while
+  two projects - two Claude sessions - run side by side.
 - **The page is never reloaded while a job renders.** A reload kills in-flight generations, so
   `flow_sweep` refuses `IN_FLIGHT` and `flow_settle` waits on the current page.
 - **A path fence.** Every local path must sit under `work_root`, checked after junctions and

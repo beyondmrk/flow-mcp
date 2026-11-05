@@ -2,8 +2,14 @@
 ledger evidence of NEW media, never an automatic second fire. fire_* and sweep settle results
 through ONE helper (_settle) so a swept result gets exactly the checks a live one gets.
 
-Order inside every fire: validate args -> TabLock (one driver of the SHARED Flow tab, across the MCP
-server and flow_fire) -> RunLock (one writer per project, across processes) ->
+ONE TAB PER PROJECT (2026-11-04): every per-project tool runs inside _on(project_dir), which resolves
+the bound Flow project id, takes THAT project's TabLock (<tab_dir>/_tab.<id>.lock) and points the driver
+at that project's own Edge window. Two projects - two Claude sessions - drive two windows at once; the
+same project is still one driver at a time. The in-flight marker is per project too
+(<tab_dir>/_tab.<id>_inflight.json), since nothing else ever navigates that window.
+
+Order inside every fire: validate args -> _on (bound id + that tab's TabLock, across the MCP servers
+of every session and flow_fire) -> RunLock (one writer per project, across processes) ->
 (clips only) lint stamp -> _gate / fire_ready -> begin_fire -> fire -> settle -> release. Nothing is
 written to pending before the lock and the stamp pass. sweep holds the same lock.
 
@@ -42,6 +48,7 @@ from .runstate import RunState
 CLIP_CREDITS = {"omni_flash": 12}  # per output; veo_lite refused until its label + cost are verified
 MAX_CLIP_COUNT = 2
 PORTRAIT_STILL = (768, 1376)  # [6][2] of a 9:16 Nano Banana 2 still (NOTES.md, aspect row)
+ASPECT_RATIO = {"9:16": 9 / 16, "16:9": 16 / 9, "1:1": 1.0, "3:4": 3 / 4, "4:3": 4 / 3}
 PUMP_MS = 100
 MODEL_WAIT_S = 10  # extra pumping for a clip's model field after its media landed
 ACCEPT_S = 20  # queued fire: how long to wait for Flow to accept the click
@@ -73,6 +80,7 @@ def rs_versions(rs: RunState, line: str) -> list:
 class Service:
     def __init__(self, page, ledger: Ledger, commit_timeout_s: float, tab_dir: Path | None = None):
         self.page, self.L, self.timeout, self.tab_dir = page, ledger, commit_timeout_s, tab_dir
+        self._key = None  # the project id whose tab (lock + marker) the current call drives
         self.wait_s = min(commit_timeout_s, MODEL_WAIT_S)  # model/url settle + post-reload pump
         self.accept_s = min(commit_timeout_s, ACCEPT_S)
         self.idle_s, self.lost_s = IDLE_S, LOST_S
@@ -91,9 +99,36 @@ class Service:
         L = Ledger(); b = Browser(cfg); b.on_response(lambda url, body: L.feed(body))
         return cls(FlowPage(b), L, cfg.commit_timeout_s, cfg.profile_dir)
 
-    def _tab(self):
-        """The browser-wide tab lock, ALWAYS taken before any RunLock (order: tab -> run)."""
-        return TabLock(self.tab_dir) if self.tab_dir is not None else contextlib.nullcontext()
+    def _tab(self, key: str | None = None):
+        """The tab lock of ONE project's window (key = Flow project id, "home" for flow_open_project
+        before a project exists, None = the legacy browser-wide lock). ALWAYS taken before any RunLock
+        (order: tab -> run)."""
+        return TabLock(self.tab_dir, key=key) if self.tab_dir is not None else contextlib.nullcontext()
+
+    def _use(self, project_id: str | None) -> None:
+        self._key = project_id
+        if hasattr(self.page, "use"):
+            self.page.use(project_id)
+
+    @staticmethod
+    def bound_id(d: Path) -> str:
+        pid = RunState(d)._load().get("projectId")
+        if not pid:
+            raise FlowError("UI_CHANGED", "no Flow project bound to this project dir - run flow_open_project first")
+        return pid
+
+    @contextlib.contextmanager
+    def _on(self, project_dir):
+        """Every per-project tool: the fenced dir, its bound project id, that project's tab lock, and
+        the driver pointed at that project's window - released and un-pointed on exit."""
+        d = check_path(project_dir)
+        pid = self.bound_id(d)
+        with self._tab(pid):
+            self._use(pid)
+            try:
+                yield d
+            finally:
+                self._use(None)
 
     def _gate(self) -> None:
         st = self.page.state()
@@ -211,7 +246,10 @@ class Service:
                        if v.get("queued") and v.get("status") in ok), key=lambda p: p.get("fired_at", 0))
 
     def _marker(self) -> Path | None:
-        return Path(self.tab_dir) / "_tab_inflight.json" if self.tab_dir is not None else None
+        if self.tab_dir is None:
+            return None
+        name = "_tab_inflight.json" if self._key is None else f"_tab.{self._key}_inflight.json"
+        return Path(self.tab_dir) / name
 
     def _marker_load(self) -> dict:
         """The tab marker {"projects": [dirs with queued attempts], "idle_nav_for": newest-fire ts whose
@@ -322,13 +360,20 @@ class Service:
         byid = {m.media_id: m for m in self.L.all()}
         return [byid.get(h.media_id, h) for h in hits]
 
-    @staticmethod
-    def _aspect(hits) -> dict:
+    def _aspect(self, hits) -> dict:
+        """9:16 keeps the exact NB2 size check; other aspects compare w/h within 2%."""
+        want = getattr(self, "_want_aspect", "9:16")
         dims = [m.dims for m in hits]
         out = {"aspect_checked": all(x is not None for x in dims)}
-        bad = next((x for x in dims if x is not None and tuple(x) != PORTRAIT_STILL), None)
+        if want == "9:16":
+            bad = next((x for x in dims if x is not None and tuple(x) != PORTRAIT_STILL), None)
+            if bad:
+                out.update(status="WRONG_ASPECT", dims=list(bad), expected_dims=list(PORTRAIT_STILL))
+            return out
+        r = ASPECT_RATIO[want]
+        bad = next((x for x in dims if x is not None and abs(x[0] / x[1] - r) / r > 0.02), None)
         if bad:
-            out.update(status="WRONG_ASPECT", dims=list(bad), expected_dims=list(PORTRAIT_STILL))
+            out.update(status="WRONG_ASPECT", dims=list(bad), expected_aspect=want)
         return out
 
     def _verdict(self, hits, stage: str, budget_s: float):
@@ -386,26 +431,47 @@ class Service:
         return out
 
     # --- tools ----------------------------------------------------------------------------------
-    def status(self) -> dict:
-        return self.page.state()
+    def status(self, project_dir=None) -> dict:
+        """Read-only: with project_dir, the state of THAT project's window."""
+        if project_dir is None:
+            return self.page.state()
+        self._use(self.bound_id(check_path(project_dir)))
+        try:
+            return self.page.state()
+        finally:
+            self._use(None)
 
     def open_project(self, name: str, project_dir) -> dict:
+        """Already bound: that project's own window (verified by name, never navigated while queued
+        fires render). Unbound: a NEW Edge window on the Flow home finds or creates the project; the
+        window is the project's from then on. Peers on other projects are not touched."""
         d = check_path(project_dir)
-        with self._tab(), RunLock(d):
-            self._refuse_in_flight("flow_open_project")
+        bound = RunState(d)._load().get("projectId")
+        if bound:
+            with self._on(d), RunLock(d):
+                self._refuse_in_flight("flow_open_project")
+                pid = self.page.open_project(name)
+                RunState(d).set_project(pid, name)
+            return {"projectId": pid, "name": name}
+        with self._tab("home"), RunLock(d):
+            self._use(None)
+            if hasattr(self.page, "new_home_tab"):
+                self.page.new_home_tab()
             pid = self.page.open_project(name)
             RunState(d).set_project(pid, name)
         return {"projectId": pid, "name": name}
 
     def upload(self, path, project_dir=None) -> dict:
-        """project_dir: upload into that dir's bound Flow project (the shared tab is moved there)."""
+        """project_dir: upload into that dir's bound Flow project, in that project's own window."""
         p = check_path(path)
         if not p.exists(): raise FlowError("REF_NOT_ATTACHED", f"{p} not on disk")
-        with self._tab():
-            if project_dir is not None:
-                rs = RunState(check_path(project_dir))
-                self._refuse_in_flight("flow_upload")  # a new upload reloads the page too
-                self._reload(rs)
+        if project_dir is None:
+            with self._tab():
+                return {"asset": self.page.upload(p)}
+        with self._on(project_dir) as d:
+            rs = RunState(d)
+            self._refuse_in_flight("flow_upload")  # a new upload reloads the page too
+            self._reload(rs)
             return {"asset": self.page.upload(p)}
 
     def upload_many(self, paths, project_dir) -> dict:
@@ -413,8 +479,8 @@ class Service:
         Per-path refusals come back in errors {path: code}; BROWSER_DOWN / CAPTCHA / LOGIN_REQUIRED
         raise (nothing else can work)."""
         ps = [check_path(x) for x in paths]
-        with self._tab():
-            rs = RunState(check_path(project_dir))
+        with self._on(project_dir) as d:
+            rs = RunState(d)
             self._refuse_in_flight("flow_upload")
             self._reload(rs)
             assets, errors = {}, {}
@@ -430,10 +496,13 @@ class Service:
             return {"assets": assets, "errors": errors}
 
     def fire_still(self, project_dir, slug, line, prompt, ref=None, outputs=1, refs=None,
-                   queue: bool = False, reroll: bool = False) -> dict:
+                   queue: bool = False, reroll: bool = False, aspect: str = "9:16") -> dict:
         """Exactly one of ref (one path) / refs (1-3 paths). Stills never check the lint stamp.
         queue=True: return QUEUED once accepted; settle() collects it."""
         check_name(slug, "slug"); check_name(line, "line")
+        if aspect not in ASPECT_RATIO:
+            raise FlowError("SETTINGS_MISMATCH", f"aspect must be one of {sorted(ASPECT_RATIO)}, got {aspect!r}")
+        self._want_aspect = aspect
         if ref is not None and refs is not None:
             raise FlowError("SETTINGS_MISMATCH", "pass ref or refs, not both")
         if ref is None and refs is None:
@@ -449,19 +518,19 @@ class Service:
         else:
             stem = check_path(ref).stem
             attach = lambda: self.page.attach(stem)
-        d = check_path(project_dir)
-        with self._tab(), RunLock(d) as lk:
+        with self._on(project_dir) as d, RunLock(d) as lk:
             rs = RunState(d)
             _, out = self._fire(rs, lk, line, "still", prompt, attach,
                                 dict(mode="image", model="nano_banana_2", count=outputs,
-                                     duration=None, video_mode=None, aspect="9:16"),
+                                     duration=None, video_mode=None, aspect=aspect),
                                 outputs, {"slug": slug}, queue=queue, reroll=reroll)
         if out["status"] in ("committed", "WRONG_ASPECT", "QUEUED"):
             out["credits"] = 0
         return out
 
     def fire_clip(self, project_dir, clip_name, line, prompt, start_frame, duration, count=1,
-                  mode="frames", model="omni_flash", reroll: bool = False, queue: bool = False) -> dict:
+                  mode="frames", model="omni_flash", reroll: bool = False, queue: bool = False,
+                  aspect: str = "9:16") -> dict:
         """reroll=False refuses ALREADY_COMMITTED when the line already holds a committed clip
         version (checked under the RunLock, before anything is written): a re-roll costs credits.
         queue=True: return QUEUED (charged) once Flow accepted the click; settle() collects it."""
@@ -471,9 +540,12 @@ class Service:
             raise FlowError("SETTINGS_MISMATCH", f"unknown clip model {model!r} (known: {sorted(CLIP_CREDITS)})")
         if not 1 <= int(count) <= MAX_CLIP_COUNT:
             raise FlowError("SETTINGS_MISMATCH", f"clip count {count} outside 1..{MAX_CLIP_COUNT}")
+        if aspect not in ("9:16", "16:9"):  # the only two the settings chip proves (CHIP_ASPECT_CHECKED)
+            raise FlowError("SETTINGS_MISMATCH", f"clip aspect must be 9:16 or 16:9, got {aspect!r}")
+        self._want_aspect = aspect
         check_name(clip_name, "clip_name"); check_name(line, "line")
-        d, sf = check_path(project_dir), check_path(start_frame)
-        with self._tab(), RunLock(d) as lk:
+        sf = check_path(start_frame)
+        with self._on(project_dir) as d, RunLock(d) as lk:
             if not reroll and rs_versions(RunState(d), line):
                 raise FlowError("ALREADY_COMMITTED", f"{line} already has a committed clip - pass reroll=True "
                                 "only on the user's go (a re-roll costs credits)")
@@ -481,7 +553,7 @@ class Service:
             rs = RunState(d)
             _, out = self._fire(rs, lk, line, "clip", prompt, lambda: self.page.attach(sf.stem),
                                 dict(mode="video", model=model, count=count, duration=duration,
-                                     video_mode=mode, aspect="9:16"),
+                                     video_mode=mode, aspect=aspect),
                                 count, {"clip_name": clip_name}, queue=queue, reroll=reroll)
         if out["status"] in ("committed", "QUEUED"):
             out["credits"] = CLIP_CREDITS[model] * count
@@ -502,8 +574,7 @@ class Service:
         return self._new_hits(p["prompt"], p["fired_at"] - 1, exclude)
 
     def sweep(self, project_dir) -> dict:
-        d = check_path(project_dir)
-        with self._tab(), RunLock(d) as lk:
+        with self._on(project_dir) as d, RunLock(d) as lk:
             return self._sweep(d, lk)
 
     def _sweep(self, d: Path, lock: RunLock) -> dict:
@@ -567,8 +638,7 @@ class Service:
         lost attempt are claimed by it. Ripe -> _settle (same verdicts as a live fire). Never listed
         after lost_s, once the idle reload happened AND no pending badge shows -> lost (LOST, spend
         unknown). The rest come back in still_rendering with their age. Never fires anything."""
-        d = check_path(project_dir)
-        with self._tab(), RunLock(d) as lk:
+        with self._on(project_dir) as d, RunLock(d) as lk:
             rs = RunState(d)
             if self._may_navigate()[0]:
                 self._reload(rs)
@@ -602,8 +672,7 @@ class Service:
             return {"results": results, "still_rendering": rendering}
 
     def download(self, project_dir, media_ids) -> dict:
-        d = check_path(project_dir)
-        with self._tab(), RunLock(d):  # it writes run state and may reload the page: never mid-fire of another run
+        with self._on(project_dir) as d, RunLock(d):  # it writes run state and may reload the page: never mid-fire of another run
             return self._download(d, media_ids)
 
     def _download(self, d: Path, media_ids) -> dict:
@@ -672,5 +741,11 @@ class Service:
                 return None
             raise
 
-    def screenshot(self) -> bytes:
+    def screenshot(self, project_dir=None) -> bytes:
+        if project_dir is not None:
+            self._use(self.bound_id(check_path(project_dir)))
+            try:
+                return self.page.screenshot()
+            finally:
+                self._use(None)
         return self.page.screenshot()

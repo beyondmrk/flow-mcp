@@ -154,7 +154,7 @@ def test_ambiguous_url_is_browser_down(monkeypatch):
 
 
 def test_connect_over_cdp_retries_then_browser_down_naming_hung_pages(monkeypatch):
-    calls, pings = [], iter([True, True, True, False])  # healthy at the preflight, one hangs later
+    calls, pings = [], iter([True, True, True, False, False, False])  # healthy at the preflight, one hangs later (3 misses = hung)
 
     class _Chromium:
         def connect_over_cdp(self, url, timeout=None):

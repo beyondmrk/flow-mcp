@@ -88,10 +88,13 @@ LOGIN_HOST = "accounts.google.com"
 
 MODE_RE = {"image": r"^\s*image\s*Image\s*$", "video": r"^\s*videocam\s*Video\s*$"}  # textContent "imageImage" (T7)
 VIDEO_MODE_RE = {"frames": r"crop_free\s*Frames", "ingredients": r"chrome_extension\s*Ingredients"}
-ASPECT_RE = {"9:16": r"crop_9_16\s*9:16", "16:9": r"crop_16_9\s*16:9"}
+ASPECT_RE = {"9:16": r"crop_9_16\s*9:16", "16:9": r"crop_16_9\s*16:9",
+             # icon ligature names for these are unverified; match "<icon><label>" by the label alone
+             "1:1": r"^\s*\w+\s*1:1\s*$", "3:4": r"^\s*\w+\s*3:4\s*$", "4:3": r"^\s*\w+\s*4:3\s*$"}
+CHIP_ASPECT_CHECKED = ("9:16", "16:9")  # the chip text is only known to carry these two
 COUNT_RE = r"^\s*x{n}\s*$"
 DURATION_RE = r"^\s*{n}s\s*$"
-MODEL_LABEL = {"nano_banana_2": "Nano Banana 2", "omni_flash": "Omni 1.1 Flash"}  # label in chip/panel
+MODEL_LABEL = {"nano_banana_2": "Nano Banana 2.1", "omni_flash": "Omni 1.1 Flash"}  # label in chip/panel; Flow renamed NB2 to "Nano Banana 2.1" (live 2026-10-07)
 PROJECT_ID_RE = re.compile(r"/project/([0-9a-f-]{36})")
 THUMB_WAIT_MS = 5000  # how long a prompt-bar thumbnail may take to appear after Add
 
@@ -118,13 +121,25 @@ class FlowPage:
                     and isinstance(payload[5], int):
                 self.balance = payload[5]  # remaining credits (NOTES: nzlxg[5])
 
+    def use(self, project_id: str | None) -> None:
+        """Drive the tab of this Flow project from now on (its own window; see browser.Browser)."""
+        if hasattr(self.browser, "use"):
+            self.browser.use(project_id)
+
+    def new_home_tab(self) -> None:
+        if hasattr(self.browser, "new_home_tab"):
+            self.browser.new_home_tab()
+
     def _p(self):
-        """The Flow page, visible, with the account popover out of the way."""
+        """The Flow page, visible, with the account popover out of the way. Each project has its
+        own window, so a peer fronting ITS window a moment ago is the normal case: retry the front."""
         p = self.browser.page()
-        if p.evaluate("document.visibilityState") != "visible":
-            p.bring_to_front()  # the dedicated window only - browser.page() never hands out another
-            if p.evaluate("document.visibilityState") != "visible":
-                raise FlowError("UI_CHANGED", "document.visibilityState != visible after bring_to_front")
+        for _ in range(3):
+            if p.evaluate("document.visibilityState") == "visible":
+                break
+            p.bring_to_front()  # a bridge-opened window only - browser.page() never hands out another
+        else:
+            raise FlowError("UI_CHANGED", "document.visibilityState != visible after bring_to_front")
         close = p.locator(ACCOUNT_PANEL_CLOSE)
         if close.count() and close.first.is_visible():
             close.first.click()  # its backdrop blocks every later click; Escape does not close it
@@ -212,7 +227,8 @@ class FlowPage:
         return m.group(1) if m else None
 
     def goto_project(self, project_id: str) -> None:
-        """Navigate the shared tab to a bound project (the caller holds the tab lock)."""
+        """Navigate the project's tab to its bound project (a reload in practice: the caller selected
+        the tab with use(project_id) and holds its tab lock)."""
         if not isinstance(project_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", project_id):
             raise FlowError("UI_CHANGED", f"bad project id {project_id!r}")
         base = self.browser.cfg.flow_url.split("/project/")[0].rstrip("/")
@@ -293,7 +309,7 @@ class FlowPage:
         chip_text = p.locator(SETTINGS_CHIP).first.inner_text()
         if mode == "image" and label not in chip_text:  # the Image chip names the model
             raise FlowError("SETTINGS_MISMATCH", f"chip reads {chip_text!r}, wanted model {label!r}")
-        if f"x{int(count)}" not in chip_text or aspect.replace(":", "_") not in chip_text:
+        if f"x{int(count)}" not in chip_text or (aspect in CHIP_ASPECT_CHECKED and aspect.replace(":", "_") not in chip_text):
             raise FlowError("SETTINGS_MISMATCH", f"chip reads {chip_text!r}, wanted {aspect} x{count}")
         self._agent_off(p)
 
@@ -310,8 +326,10 @@ class FlowPage:
             if self._model_selected(p, label):
                 return
             trig.first.click()
-            # labels carry an emoji prefix; the $ anchor keeps "Nano Banana 2" off "... 2 Lite"
-            opt = p.locator(MODEL_OPTION).filter(has_text=re.compile(rf"(^|\s){re.escape(label)}\s*$"))
+            # labels carry an emoji prefix; the $ anchor keeps "Nano Banana 2" off "... 2 Lite".
+            # Video models carry a "volume_up" icon ligature glued to the name in textContent (live 2026-11-02).
+            opt = p.locator(MODEL_OPTION).filter(
+                has_text=re.compile(rf"(^|\s|volume_up|volume_off){re.escape(label)}\s*$"))
             try:
                 opt.first.wait_for(state="visible", timeout=self.ui_timeout_ms)
             except Exception:

@@ -16,11 +16,16 @@ class Config:
     denied_roots: tuple[Path, ...] = ()  # refused even when under work_root
 
 
+def _path(value) -> Path:
+    p = Path(value)  # a relative path is relative to this checkout, so a cloned repo needs no edit
+    return p if p.is_absolute() else (HERE / p).resolve()
+
+
 def _coerce(key: str, value):
     if key in ("edge_exe", "profile_dir", "work_root"):
-        return Path(value)
+        return _path(value)
     if key == "denied_roots":
-        return tuple(Path(x) for x in value)
+        return tuple(_path(x) for x in value)
     return value
 
 

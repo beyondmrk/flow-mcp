@@ -18,7 +18,7 @@ TOGGLES = [("mode", "image", "image Image"), ("mode", "video", "videocam Video")
 
 
 def fake_flow(pill="off", fire=True, banner=False, account_panel=False, stuck=(), aspect="16:9",
-              editor_text="", assets=("ref_a", "ref_b"), model="Nano Banana 2", model_stuck=False,
+              editor_text="", assets=("ref_a", "ref_b"), model="Nano Banana 2.1", model_stuck=False,
               add_thumbs=1, add_delay=0, fire_disabled=False, max_thumbs=99, box="image"):
     # box: "image" = Add-ingredients button; "frames" = Frames Start chip only; "late_attach" = a
     # leftover filled frame chip renders at once and the Add-ingredients button only ~700 ms later
@@ -34,7 +34,7 @@ def fake_flow(pill="off", fire=True, banner=False, account_panel=False, stuck=()
     # live shapes (T7 probe): model menu items carry an emoji prefix and a "... 2 Lite" sibling;
     # picker rows are button[role=option] "<title> / Image" inside the "Asset list" listbox
     models = "".join(f'<button role="menuitem" class="model-opt" data-label="{m}">🍌 {m}</button>'
-                     for m in ("Nano Banana Pro", "Nano Banana 2", "Nano Banana 2 Lite",
+                     for m in ("Nano Banana Pro", "Nano Banana 2.1", "Nano Banana 2 Lite",
                                "Omni 1.1 Flash", "Veo 3.1 Lite"))
     rows = "".join(f'<button role="option" class="asset-item"><img src="data:,">{a}<br>Image</button>'
                    for a in assets)
@@ -209,8 +209,8 @@ def test_stuck_toggle_is_settings_mismatch(make):
 def test_model_is_selected_in_panel(make):
     fp, pg = make(model="Nano Banana Pro")
     fp.set_settings(mode="image", model="nano_banana_2", count=1, duration=None, video_mode=None)
-    assert pg.locator("#model").get_attribute("data-label") == "Nano Banana 2"
-    assert "Nano Banana 2" in pg.locator("#chip").inner_text()
+    assert pg.locator("#model").get_attribute("data-label") == "Nano Banana 2.1"
+    assert "Nano Banana 2.1" in pg.locator("#chip").inner_text()
 
 
 def test_video_model_is_selected_not_just_present(make):

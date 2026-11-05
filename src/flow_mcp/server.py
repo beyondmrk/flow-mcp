@@ -36,10 +36,13 @@ async def _run(method: str, **kwargs: Any) -> Any:
 
 
 @mcp.tool()
-async def flow_status() -> dict[str, Any]:
-    """Read the dedicated Flow window: url, captcha, signed_in, out_of_credits, banner, credit
-    balance (None until Flow's ~30 s credit poll arrives). Free, read-only."""
-    return await _run("status")
+async def flow_status(project_dir: str | None = None) -> dict[str, Any]:
+    """Read a Flow window: url, captcha, signed_in, out_of_credits, banner, credit balance (None
+    until Flow's ~30 s credit poll arrives). Each project has its own window: pass project_dir to
+    read that project's. Free, read-only."""
+    if project_dir is None:
+        return await _run("status")
+    return await _run("status", project_dir=project_dir)
 
 
 @mcp.tool()
@@ -52,8 +55,8 @@ async def flow_open_project(name: str, project_dir: str) -> dict[str, Any]:
 @mcp.tool()
 async def flow_upload(path: str, project_dir: str | None = None) -> dict[str, Any]:
     """Upload a local image into a Flow project's assets; returns the asset name (file stem) that
-    flow_fire_still / flow_fire_clip attach by. With project_dir, the shared Flow tab is first moved
-    to that dir's bound project (pass it: a peer may have left the tab elsewhere). Free."""
+    flow_fire_still / flow_fire_clip attach by. With project_dir, the upload goes into that dir's
+    bound project, in that project's own window (pass it). Free."""
     if project_dir is None:
         return await _run("upload", path=path)
     return await _run("upload", path=path, project_dir=project_dir)
@@ -62,8 +65,9 @@ async def flow_upload(path: str, project_dir: str | None = None) -> dict[str, An
 @mcp.tool()
 async def flow_fire_still(project_dir: str, slug: str, line: str, prompt: str,
                           refs: list[str] | None = None, ref: str | None = None,
-                          outputs: int = 1, queue: bool = False) -> dict[str, Any]:
-    """Fire ONE Image-mode still: Nano Banana 2, 9:16, x`outputs`. 0 credits. Pass exactly one of
+                          outputs: int = 1, queue: bool = False, aspect: str = "9:16") -> dict[str, Any]:
+    """Fire ONE Image-mode still: Nano Banana 2, `aspect` (9:16 default; also 16:9, 1:1, 3:4, 4:3),
+    x`outputs`. 0 credits. Pass exactly one of
     `ref` (one uploaded asset's local path) or `refs` (1-3 paths, attached in order by stem); the
     prompt bar must then hold exactly that many thumbnails or it refuses REF_NOT_ATTACHED. Stills do
     not need a lint stamp. Refuses RUN_LOCKED while another run holds the project. Waits for Flow's
@@ -72,7 +76,7 @@ async def flow_fire_still(project_dir: str, slug: str, line: str, prompt: str,
     queue=True (waves): returns QUEUED once the fire is ACCEPTED by Flow, not landed - call
     flow_settle to collect it."""
     return await _run("fire_still", project_dir=project_dir, slug=slug, line=line, prompt=prompt,
-                      ref=ref, refs=refs, outputs=outputs, queue=queue)
+                      ref=ref, refs=refs, outputs=outputs, queue=queue, aspect=aspect)
 
 
 @mcp.tool()
@@ -128,9 +132,12 @@ async def flow_download(project_dir: str, media_ids: list[str]) -> dict[str, Any
 
 
 @mcp.tool()
-async def flow_screenshot() -> Image:
-    """PNG screenshot of the dedicated Flow window, for debugging a UI_CHANGED error. Free."""
-    return Image(data=await _run("screenshot"), format="png")
+async def flow_screenshot(project_dir: str | None = None) -> Image:
+    """PNG screenshot of a Flow window (project_dir: that project's own window), for debugging a
+    UI_CHANGED error. Free."""
+    if project_dir is None:
+        return Image(data=await _run("screenshot"), format="png")
+    return Image(data=await _run("screenshot", project_dir=project_dir), format="png")
 
 
 def main() -> None:

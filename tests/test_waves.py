@@ -10,7 +10,7 @@ from flow_mcp.netwatch import Ledger, Media
 from flow_mcp.runstate import RunState
 from flow_mcp.service import Service
 
-from .test_service import FakePage, proj
+from .test_service import TEST_PID, FakePage, proj
 
 
 class WavePage(FakePage):
@@ -425,23 +425,29 @@ def test_late_media_for_a_lost_attempt_is_claimed_by_it(tmp_path):
     assert RunState(d).attempts()[a]["status"] == "committed"
 
 
-def test_tab_wide_in_flight_refuses_another_project(tmp_path):
+def test_in_flight_is_per_project_window(tmp_path):
+    """A peer on the SAME Flow project (its window has queued fires rendering) is refused IN_FLIGHT;
+    a peer on ANOTHER project drives its own window and proceeds."""
+    import json
     import pathlib
     tab = tmp_path / "tab"
     L = Ledger(extractors=[])
     s = Service.for_test(WavePage(L), L, commit_timeout_s=0.2, tab_dir=tab)
-    a, b = proj(tmp_path), proj(pathlib.Path(str(tmp_path) + "_B"))
+    a, same, other = (proj(tmp_path), proj(pathlib.Path(str(tmp_path) + "_B")),
+                      proj(pathlib.Path(str(tmp_path) + "_C")))
+    RunState(other).set_project("11111111-2222-3333-4444-555555555555", "C")  # its own window
     s.fire_clip(a, "NJ_line01", "L01", "hello", a / "a.png", 8, queue=True)
-    (b / "x.png").write_bytes(b"x")
-    L2 = Ledger(extractors=[])  # a PEER process (e.g. the MCP server) sharing the tab
+    for d in (same, other):
+        (d / "x.png").write_bytes(b"x")
+    L2 = Ledger(extractors=[])  # a PEER process (e.g. another session's MCP server)
     peer = Service.for_test(WavePage(L2), L2, commit_timeout_s=0.2, tab_dir=tab)
-    for call in (lambda: peer.upload(b / "x.png", b), lambda: peer.open_project("B", b),
-                 lambda: peer.sweep(b)):
+    for call in (lambda: peer.upload(same / "x.png", same), lambda: peer.open_project("B", same),
+                 lambda: peer.sweep(same)):
         with pytest.raises(FlowError) as e:
             call()
         assert e.value.code == "IN_FLIGHT"
-    import json
-    assert str(a) in json.loads((tab / "_tab_inflight.json").read_text())["projects"]
+    peer.upload(other / "x.png", other); peer.sweep(other)  # another project: never blocked
+    assert str(a) in json.loads((tab / f"_tab.{TEST_PID}_inflight.json").read_text())["projects"]
 
 
 def test_tab_marker_prunes_a_project_with_nothing_in_flight(tmp_path):
@@ -452,7 +458,7 @@ def test_tab_marker_prunes_a_project_with_nothing_in_flight(tmp_path):
     s.fire_clip(d, "NJ_line01", "L01", "hello", d / "a.png", 8, queue=True)
     s.page.render("m1"); s.settle(d)
     import json
-    assert str(d) not in json.loads((tab / "_tab_inflight.json").read_text())["projects"]
+    assert str(d) not in json.loads((tab / f"_tab.{TEST_PID}_inflight.json").read_text())["projects"]
     (d / "x.png").write_bytes(b"x")
     s.upload(d / "x.png", d)  # free again
 
@@ -484,7 +490,7 @@ def test_idle_reload_is_shared_across_processes(tmp_path):
     s.fire_clip(d, "NJ_line01", "L01", "hello", d / "a.png", 8, queue=True)
     s.idle_s = peer.idle_s = 0
     s.settle(d)  # spends the one idle reload
-    assert json.loads((tab / "_tab_inflight.json").read_text())["idle_nav_for"] is not None
+    assert json.loads((tab / f"_tab.{TEST_PID}_inflight.json").read_text())["idle_nav_for"] is not None
     peer.page.project_id = s.page.project_id
     peer.settle(d)
     assert navs(peer) == []  # the peer sees it used: no second reload in the same idle period
@@ -506,11 +512,11 @@ def test_unreadable_marker_fails_closed(tmp_path):
     (d / "x.png").write_bytes(b"x")
     tab.mkdir(parents=True, exist_ok=True)
     for bad, word in (("{not json", "unreadable"), ('{"projects": "x"}', "unexpected content")):
-        (tab / "_tab_inflight.json").write_text(bad, encoding="utf-8")
+        (tab / f"_tab.{TEST_PID}_inflight.json").write_text(bad, encoding="utf-8")
         with pytest.raises(FlowError) as e:
             s.upload(d / "x.png", d)
         assert e.value.code == "IN_FLIGHT" and word in str(e.value)
-    (tab / "_tab_inflight.json").unlink()
+    (tab / f"_tab.{TEST_PID}_inflight.json").unlink()
     assert s.upload(d / "x.png", d)["asset"] == "x"  # only a MISSING marker means free
 
 

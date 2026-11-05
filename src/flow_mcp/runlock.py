@@ -177,8 +177,15 @@ class RunLock:
         return False
 
 
-def TabLock(profile_dir: Path, ttl_s: int = TTL_S) -> RunLock:
-    """Browser-wide lock on the ONE shared Flow tab (attach-only peers: MCP server, flow_fire).
+def tab_lock_name(key: str | None) -> str:
+    """key None = the legacy browser-wide lock; a project id (or "home") = that tab's own lock."""
+    return TAB_LOCK_NAME if key is None else f"_tab.{key}.lock"
+
+
+def TabLock(profile_dir: Path, ttl_s: int = TTL_S, key: str | None = None) -> RunLock:
+    """Lock on ONE Flow tab (attach-only peers: the MCP servers of several Claude sessions, flow_fire).
+    key = the Flow project id whose tab it is ("home" for the tab flow_open_project drives before a
+    project exists); None = the legacy browser-wide lock, taken by calls with no project.
     Same pid/nonce/TTL/tombstone mechanics as RunLock. Lock order is always tab -> run."""
-    return RunLock(profile_dir, ttl_s, name=TAB_LOCK_NAME,
-                   what="another process is driving the shared Flow tab")
+    return RunLock(profile_dir, ttl_s, name=tab_lock_name(key),
+                   what=f"another process is driving the Flow tab of {key or 'the shared window'}")

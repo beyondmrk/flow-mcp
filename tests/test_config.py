@@ -21,3 +21,11 @@ def test_path_fence_keys(tmp_path):
     c = load_config(f)
     assert c.work_root == Path("C:/work")
     assert c.denied_roots == (Path("C:/work/mount"), Path("E:/"))
+
+
+def test_relative_paths_resolve_against_checkout(tmp_path):
+    f = tmp_path / "c.toml"
+    f.write_text('work_root = "../.."\ndenied_roots = ["../../_denied"]\n')
+    c = load_config(f)
+    assert c.work_root == (HERE / "../..").resolve()
+    assert c.denied_roots == ((HERE / "../../_denied").resolve(),)
